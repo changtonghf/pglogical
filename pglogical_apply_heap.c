@@ -223,7 +223,7 @@ fill_missing_defaults(PGLogicalRelation *rel, EState *estate,
 	{
 		Expr	   *defexpr;
 
-		if (TupleDescAttr(desc,attnum)->attisdropped)
+		if (TupleDescAttr(desc,attnum)->attisdropped || TupleDescAttr(desc,attnum)->attgenerated != '\0')
 			continue;
 
 		if (physatt_in_attmap(rel, attnum))

@@ -28,7 +28,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_type.h"
-
+#include "catalog/pg_inherits.h"
 #include "executor/spi.h"
 
 #include "nodes/makefuncs.h"
@@ -42,7 +42,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-
+#include "utils/json.h"
 #include "pglogical_dependency.h"
 #include "pglogical_node.h"
 #include "pglogical_queue.h"
@@ -97,7 +97,7 @@ typedef struct RepSetTableTuple
 #define Natts_repset_table				4
 #define Anum_repset_table_setid			1
 #define Anum_repset_table_reloid		2
-#define Anum_repset_table_att_list	3
+#define Anum_repset_table_att_list		3
 #define Anum_repset_table_row_filter	4
 
 
@@ -210,24 +210,12 @@ repset_relcache_invalidate_callback(Datum arg, Oid reloid)
 		while ((entry = hash_seq_search(&status)) != NULL)
 		{
 			entry->isvalid = false;
-			if (entry->att_list)
-				pfree(entry->att_list);
-			entry->att_list = NULL;
-			if (list_length(entry->row_filter))
-				list_free_deep(entry->row_filter);
-			entry->row_filter = NIL;
 		}
 	}
 	else if ((entry = hash_search(RepSetTableHash, &reloid,
 								  HASH_FIND, NULL)) != NULL)
 	{
 		entry->isvalid = false;
-		if (entry->att_list)
-			pfree(entry->att_list);
-		entry->att_list = NULL;
-		if (list_length(entry->row_filter))
-			list_free_deep(entry->row_filter);
-		entry->row_filter = NIL;
 	}
 }
 
@@ -405,14 +393,20 @@ get_table_replication_info(Oid nodeid, Relation table,
 	if (found && entry->isvalid)
 		return entry;
 
-	/* Fill the entry */
-	entry->reloid = reloid;
-	entry->replicate_insert = false;
-	entry->replicate_update = false;
-	entry->replicate_delete = false;
-	entry->att_list = NULL;
-	entry->row_filter = NIL;
+	/* If an entry was found but entry is Invalid, free its att_list and row_filter fields if they are allocated */
+	if (found)
+	{
+		if (entry->att_list)
+			pfree(entry->att_list);
 
+		if (list_length(entry->row_filter))
+			list_free_deep(entry->row_filter);
+	}
+
+	/* Reset all fields in the entry structure except for reloid */
+	MemSet(((char *) entry) + sizeof(entry->reloid), 0, sizeof(PGLogicalTableRepInfo) - sizeof(Oid));
+
+	/* Fill the entry */
 	/*
 	 * Check for match between table's replication sets and the subscription
 	 * list of replication sets that was given as parameter.
@@ -1106,6 +1100,137 @@ replication_set_add_table(Oid setid, Oid reloid, List *att_list,
 	table_close(rel, RowExclusiveLock);
 
 	CommandCounterIncrement();
+}
+
+/*
+ * Recurse Alter exist replication set / table mapping.
+ */
+void
+replication_set_alter_table_recurse(PGLogicalRepSet *repset, Oid reloid, List *att_list, Node *row_filter, bool synchronize)
+{
+	List	*children;
+	ListCell   *child;
+
+	children = find_inheritance_children(reloid, NoLock);
+
+	if (children  != NIL)
+	{
+		foreach(child, children)
+		{
+			Oid childrelid = lfirst_oid(child);
+			replication_set_alter_table_recurse(repset, childrelid, att_list, row_filter, synchronize);
+		}
+	}
+	else
+	{
+		Relation		rel = table_open(reloid, AccessShareLock);
+		char	   	   *nspname = get_namespace_name(RelationGetNamespace(rel));
+		char	   	   *relname = RelationGetRelationName(rel);
+		StringInfoData	json;
+
+		replication_set_alter_table(repset->id, reloid, att_list, row_filter);
+
+		if (synchronize)
+		{
+			/* It's easier to construct json manually than via Jsonb API... */
+			initStringInfo(&json);
+			appendStringInfo(&json, "{\"schema_name\": ");
+			escape_json(&json, nspname);
+			appendStringInfo(&json, ",\"table_name\": ");
+			escape_json(&json, relname);
+			appendStringInfo(&json, "}");
+			/* Queue the synchronize request for replication. */
+			queue_message(list_make1(repset->name), GetUserId(), QUEUE_COMMAND_TYPE_TABLESYNC, json.data);
+		}
+		table_close(rel, AccessShareLock);
+	}
+}
+
+/*
+ * Alter exist replication set / table mapping.
+ */
+void
+replication_set_alter_table(Oid setid, Oid reloid, List *att_list, Node *row_filter)
+{
+	RangeVar   		   *rv;
+	Relation			rel;
+	TupleDesc			tupDesc;
+	SysScanDesc			scan;
+	HeapTuple			oldtup,
+						newtup;
+	ScanKeyData			key[2];
+	Datum				values[Natts_repset_table];
+	bool				nulls[Natts_repset_table];
+	bool				replaces[Natts_repset_table];
+	ObjectAddress		referenced;
+	ObjectAddress		myself;
+
+	/* Open the catalog. */
+	rv = makeRangeVar(EXTENSION_NAME, CATALOG_REPSET_TABLE, -1);
+	rel = table_openrv(rv, RowExclusiveLock);
+	tupDesc = RelationGetDescr(rel);
+
+	ScanKeyInit(&key[0], Anum_repset_table_setid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(setid));
+	ScanKeyInit(&key[1], Anum_repset_table_reloid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(reloid));
+
+	scan = systable_beginscan(rel, 0, true, NULL, 2, key);
+	oldtup = systable_getnext(scan);
+
+	if (!HeapTupleIsValid(oldtup))
+	{
+		CommandCounterIncrement();
+		systable_endscan(scan);
+		table_close(rel, RowExclusiveLock);
+		return;
+	}
+
+	/* Form a tuple. */
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, true, sizeof(replaces));
+
+	replaces[Anum_repset_table_setid - 1] = false;
+	replaces[Anum_repset_table_reloid - 1] = false;
+
+	if (list_length(att_list))
+		values[Anum_repset_table_att_list - 1] = PointerGetDatum(strlist_to_textarray(att_list));
+	else
+		nulls[Anum_repset_table_att_list - 1] = true;
+
+	if (row_filter)
+		values[Anum_repset_table_row_filter - 1] = CStringGetTextDatum(nodeToString(row_filter));
+	else
+		nulls[Anum_repset_table_row_filter - 1] = true;
+
+	newtup = heap_modify_tuple(oldtup, tupDesc, values, nulls, replaces);
+
+	/* Update the tuple in catalog. */
+	CatalogTupleUpdate(rel, &oldtup->t_self, newtup);
+
+	/* Cleanup. */
+	CacheInvalidateRelcacheByRelid(reloid);
+	heap_freetuple(newtup);
+
+	myself.classId = get_replication_set_table_rel_oid();
+	myself.objectId = setid;
+	myself.objectSubId = reloid;
+
+	pglogical_tryDropDependencies(&myself, DROP_CASCADE);
+
+	referenced.classId = RelationRelationId;
+	referenced.objectId = reloid;
+	referenced.objectSubId = 0;
+
+	pglogical_recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+
+	/* Make sure we record dependencies for the row_filter as well. */
+	if (row_filter)
+	{
+		pglogical_recordDependencyOnSingleRelExpr(&myself, row_filter, reloid, DEPENDENCY_NORMAL, DEPENDENCY_NORMAL);
+	}
+
+	CommandCounterIncrement();
+	systable_endscan(scan);
+	table_close(rel, RowExclusiveLock);
 }
 
 /*

@@ -35,7 +35,8 @@ typedef struct PGLogicalRelation
 	char	   *relname;
 	int			natts;
 	char	  **attnames;
-
+	int			nkeys;
+	char	  **keynames;
 	/* Mapping to local relation, filled as needed. */
 	Oid			reloid;
 	Relation	rel;
@@ -47,7 +48,7 @@ typedef struct PGLogicalRelation
 
 extern void pglogical_relation_cache_update(uint32 remoteid,
 											 char *schemaname, char *relname,
-											 int natts, char **attnames);
+											 int natts, char **attnames, int nkeys, char **keynames);
 extern void pglogical_relation_cache_updater(PGLogicalRemoteRel *remoterel);
 
 extern PGLogicalRelation *pglogical_relation_open(uint32 remoteid,

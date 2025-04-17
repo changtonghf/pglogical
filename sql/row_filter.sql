@@ -70,7 +70,14 @@ SELECT nspname, relname, set_name FROM pglogical.tables WHERE relname = 'basic_d
 
 -- fail, the membership in repset depends on data column
 \set VERBOSITY terse
-ALTER TABLE basic_dml DROP COLUMN data;
+DO $$
+BEGIN
+	ALTER TABLE basic_dml DROP COLUMN data;
+EXCEPTION WHEN dependent_objects_still_exist THEN
+	-- hide PostgreSQL-version-specific sqlerrm
+	RAISE 'got dependent_objects_still_exist';
+END
+$$;
 \set VERBOSITY default
 
 SELECT pglogical.wait_slot_confirm_lsn(NULL, NULL);
@@ -79,7 +86,7 @@ SELECT pglogical.wait_slot_confirm_lsn(NULL, NULL);
 
 -- wait for the initial data to copy
 BEGIN;
-SET LOCAL statement_timeout = '10s';
+SET LOCAL statement_timeout = '180s';
 SELECT pglogical.wait_for_subscription_sync_complete('test_subscription');
 COMMIT;
 
@@ -359,11 +366,26 @@ BEGIN
 END;
 $$;
 
--- fails with SRF context error
+-- fails with PostgreSQL-version-specific SRF context error
 BEGIN;
 SELECT * FROM pglogical.replication_set_remove_table('default', 'basic_dml');
-SELECT * FROM pglogical.replication_set_add_table('default', 'basic_dml', false,
-	row_filter := $rf$ (func_plpgsql_srf_retq(other)).result = 500 $rf$);
+\set VERBOSITY terse
+DO $$
+DECLARE
+	want text[] := array['argument of row_filter must not return a set', -- before v10
+						 'set-returning functions are not allowed in check constraints'];
+BEGIN
+	SELECT * FROM pglogical.replication_set_add_table('default', 'basic_dml', false,
+		row_filter := $rf$ (func_plpgsql_srf_retq(other)).result = 500 $rf$);
+EXCEPTION WHEN OTHERS THEN
+	IF sqlerrm = ANY(want) THEN
+		RAISE 'one of: %', want;
+	ELSE
+		RAISE;
+	END IF;
+END
+$$;
+\set VERBOSITY default
 ROLLBACK;
 
 CREATE FUNCTION func_plpgsql_call_set(arg integer)
