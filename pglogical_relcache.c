@@ -13,20 +13,22 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
-
+#include "access/genam.h"
 #include "catalog/pg_trigger.h"
 
 #include "commands/trigger.h"
-
+#include "nodes/makefuncs.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/rel.h"
+#include "utils/array.h"
 
 #include "pglogical.h"
 #include "pglogical_relcache.h"
+#include "pglogical_worker.h"
 
 #define PGLOGICALRELATIONHASH_INITIAL_SIZE 128
 static HTAB *PGLogicalRelationHash = NULL;
@@ -51,10 +53,21 @@ relcache_free_entry(PGLogicalRelation *entry)
 		pfree(entry->attnames);
 	}
 
+	if (entry->nkeys > 0)
+	{
+		int	j;
+
+		for (j = 0; j < entry->nkeys; j++)
+			pfree(entry->keynames[j]);
+
+		pfree(entry->keynames);
+	}
+
 	if (entry->attmap)
 		pfree(entry->attmap);
 
 	entry->natts = 0;
+	entry->nkeys = 0;
 	entry->reloid = InvalidOid;
 	entry->rel = NULL;
 }
@@ -122,38 +135,111 @@ pglogical_relation_open(uint32 remoteid, LOCKMODE lockmode)
 }
 
 void
-pglogical_relation_cache_update(uint32 remoteid, char *schemaname,
-								 char *relname, int natts, char **attnames)
+pglogical_relation_cache_update(uint32 remoteid, char *schemaname, char *relname, int natts, char **attnames, int nkeys, char **keynames)
 {
-	MemoryContext		oldcontext;
+	MemoryContext		ctx1, ctx2;
 	PGLogicalRelation  *entry;
 	bool				found;
-	int					i;
+	RangeVar		   *rv;
+	Relation			re;
+	TupleDesc			desc;
+	HeapTuple			tuple;
+	SysScanDesc			scan;
+	ScanKeyData			key[3];
+	bool				isnull;
+	int					i, j;
 
 	if (PGLogicalRelationHash == NULL)
 		pglogical_relcache_init();
 
-	/*
-	 * HASH_ENTER returns the existing entry if present or creates a new one.
-	 */
-	entry = hash_search(PGLogicalRelationHash, (void *) &remoteid,
-						HASH_ENTER, &found);
+	entry = hash_search(PGLogicalRelationHash, (void *) &remoteid, HASH_ENTER, &found);
 
 	if (found)
 		relcache_free_entry(entry);
 
-	/* Make cached copy of the data */
-	oldcontext = MemoryContextSwitchTo(CacheMemoryContext);
-	entry->nspname = pstrdup(schemaname);
-	entry->relname = pstrdup(relname);
-	entry->natts = natts;
-	entry->attnames = palloc(natts * sizeof(char *));
-	for (i = 0; i < natts; i++)
-		entry->attnames[i] = pstrdup(attnames[i]);
-	entry->attmap = palloc(natts * sizeof(int));
-	MemoryContextSwitchTo(oldcontext);
+	ctx1 = CurrentMemoryContext;
+	if (! IsTransactionState()) StartTransactionCommand();
 
-	/* XXX Should we validate the relation against local schema here? */
+	rv = makeRangeVar(EXTENSION_NAME, APPLY_MAPPING_TABLE, -1);
+	re = table_openrv(rv, AccessShareLock);
+	desc = RelationGetDescr(re);
+
+	ScanKeyInit(&key[0], 1, BTEqualStrategyNumber, F_OIDEQ , ObjectIdGetDatum(MySubscription->id));
+	ScanKeyInit(&key[1], 2, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(schemaname));
+	ScanKeyInit(&key[2], 3, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(relname));
+
+	scan = systable_beginscan(re, 0, true, NULL, 3, key);
+	tuple = systable_getnext(scan);
+
+	ctx2 = MemoryContextSwitchTo(CacheMemoryContext);
+	entry->natts = natts;
+	entry->nkeys = nkeys;
+	entry->attmap   = palloc(natts * sizeof(int));
+	entry->attnames = palloc(natts * sizeof(char *));
+	entry->keynames = palloc(nkeys * sizeof(char *));
+	if (HeapTupleIsValid(tuple))
+	{
+		Datum srcattr, dstattr;
+		entry->nspname = pstrdup(TextDatumGetCString(heap_getattr(tuple, 5, desc, &isnull)));
+		entry->relname = pstrdup(TextDatumGetCString(heap_getattr(tuple, 6, desc, &isnull)));
+		srcattr = heap_getattr(tuple, 4, desc, &isnull);
+		dstattr = heap_getattr(tuple, 7, desc, &isnull);
+		if (isnull)
+		{
+			for (i = 0; i < natts; i++)
+				entry->attnames[i] = pstrdup(attnames[i]);
+			for (j = 0; j < nkeys; j++)
+				entry->keynames[j] = pstrdup(keynames[j]);
+		}
+		else
+		{
+			Datum		*_elems, *elems_;
+			int			 _nelem,  nelem_;
+			ArrayType	*_attrs, *attrs_;
+			_attrs = DatumGetArrayTypeP(srcattr);
+			deconstruct_array(_attrs, TEXTOID, -1, false, TYPALIGN_INT, &_elems, NULL, &_nelem);
+			attrs_ = DatumGetArrayTypeP(dstattr);
+			deconstruct_array(attrs_, TEXTOID, -1, false, TYPALIGN_INT, &elems_, NULL, &nelem_);
+			for (i = 0; i < natts; i++)
+			{
+				for (j = 0; j < natts; j++)
+				{
+					if (strcmp(attnames[i], TextDatumGetCString(_elems[j])) == 0)
+					{
+						entry->attnames[i] = pstrdup(TextDatumGetCString(elems_[j]));
+						break;
+					}
+				}
+			}
+			for (i = 0; i < nkeys; i++)
+			{
+				for (j = 0; j < natts; j++)
+				{
+					if (strcmp(keynames[i], TextDatumGetCString(_elems[j])) == 0)
+					{
+						entry->keynames[i] = pstrdup(TextDatumGetCString(elems_[j]));
+						break;
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		entry->nspname = pstrdup(schemaname);
+		entry->relname = pstrdup(relname);
+		for (i = 0; i < natts; i++)
+			entry->attnames[i] = pstrdup(attnames[i]);
+		for (j = 0; j < nkeys; j++)
+			entry->keynames[j] = pstrdup(keynames[j]);
+	}
+
+	systable_endscan(scan);
+	table_close(re, AccessShareLock);
+	MemoryContextSwitchTo(ctx2);
+
+	CommitTransactionCommand();
+	MemoryContextSwitchTo(ctx1);
 
 	entry->reloid = InvalidOid;
 }

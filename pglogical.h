@@ -33,9 +33,9 @@
 #define PGLOGICAL_MIN_PROTO_VERSION_NUM 1
 #define PGLOGICAL_MAX_PROTO_VERSION_NUM 1
 
-#define EXTENSION_NAME "pglogical"
-
-#define REPLICATION_ORIGIN_ALL "all"
+#define EXTENSION_NAME			"pglogical"
+#define REPLICATION_ORIGIN_ALL	"all"
+#define APPLY_MAPPING_TABLE		"rel_apply_mapping"
 
 #if PG_VERSION_NUM >= 90500
 #define HAVE_REPLICATION_ORIGINS
@@ -46,6 +46,7 @@ extern char *pglogical_temp_directory;
 extern bool pglogical_use_spi;
 extern bool pglogical_batch_inserts;
 extern char *pglogical_extra_connection_options;
+extern int	pglogical_max_sync_workers_per_subscription;
 
 #if PG_VERSION_NUM >= 150000
 extern shmem_request_hook_type prev_shmem_request_hook;

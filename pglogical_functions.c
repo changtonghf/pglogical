@@ -114,6 +114,7 @@ PG_FUNCTION_INFO_V1(pglogical_create_replication_set);
 PG_FUNCTION_INFO_V1(pglogical_alter_replication_set);
 PG_FUNCTION_INFO_V1(pglogical_drop_replication_set);
 PG_FUNCTION_INFO_V1(pglogical_replication_set_add_table);
+PG_FUNCTION_INFO_V1(pglogical_replication_set_alter_table);
 PG_FUNCTION_INFO_V1(pglogical_replication_set_add_all_tables);
 PG_FUNCTION_INFO_V1(pglogical_replication_set_remove_table);
 PG_FUNCTION_INFO_V1(pglogical_replication_set_add_sequence);
@@ -1494,6 +1495,84 @@ pglogical_replication_set_add_table(PG_FUNCTION_ARGS)
 		queue_message(list_make1(repset->name), GetUserId(),
 					  QUEUE_COMMAND_TYPE_TABLESYNC, json.data);
 	}
+
+	/* Cleanup. */
+	table_close(rel, NoLock);
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * Alter exist replication set / table mapping.
+ */
+Datum
+pglogical_replication_set_alter_table(PG_FUNCTION_ARGS)
+{
+	Oid					reloid = PG_GETARG_OID(1);
+	bool				synchronize = PG_GETARG_BOOL(2);
+	Node			   *row_filter = NULL;
+	List			   *att_list = NIL;
+	PGLogicalRepSet    *repset;
+	Relation			rel;
+	TupleDesc			tupDesc;
+	PGLogicalLocalNode *node;
+	char			   *nspname;
+	char			   *relname;
+
+	/* Proccess for required parameters. */
+	if (PG_ARGISNULL(0))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("set_name cannot be NULL")));
+	if (PG_ARGISNULL(1))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("relation cannot be NULL")));
+	if (PG_ARGISNULL(2))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("synchronize_data cannot be NULL")));
+
+	/* standard check for node. */
+	node = check_local_node(true);
+
+	/* Find the replication set. */
+	repset = get_replication_set_by_name(node->node->id, NameStr(*PG_GETARG_NAME(0)), false);
+
+	/* Make sure the relation exists (lock mode has to be the same one as in replication_set_add_relation). */
+	rel = table_open(reloid, ShareRowExclusiveLock);
+	tupDesc = RelationGetDescr(rel);
+
+	nspname = get_namespace_name(RelationGetNamespace(rel));
+	relname = RelationGetRelationName(rel);
+
+	/* Proccess att_list. */
+	if (!PG_ARGISNULL(3))
+	{
+		ArrayType  *att_names = PG_GETARG_ARRAYTYPE_P(3);
+		ListCell   *lc;
+		Bitmapset  *idattrs;
+
+		/* fetch bitmap of REPLICATION IDENTITY attributes */
+		idattrs = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+
+		att_list = textarray_to_list(att_names);
+		foreach (lc, att_list)
+		{
+			char   *attname = (char *) lfirst(lc);
+			int		attnum = get_att_num_by_name(tupDesc, attname);
+
+			if (attnum < 0)
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("table %s does not have column %s", quote_qualified_identifier(nspname, relname), attname)));
+
+			idattrs = bms_del_member(idattrs, attnum - FirstLowInvalidHeapAttributeNumber);
+		}
+
+		if (!bms_is_empty(idattrs))
+			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("REPLICA IDENTITY columns must be replicated")));
+	}
+
+	/* Proccess row_filter if any. */
+	if (!PG_ARGISNULL(4))
+	{
+		row_filter = parse_row_filter(rel, text_to_cstring(PG_GETARG_TEXT_PP(4)));
+	}
+
+	replication_set_alter_table_recurse(repset, reloid, att_list, row_filter, synchronize);
 
 	/* Cleanup. */
 	table_close(rel, NoLock);

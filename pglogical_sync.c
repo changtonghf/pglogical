@@ -85,6 +85,7 @@
 #define Anum_sync_relname		4
 #define Anum_sync_status		5
 #define Anum_sync_statuslsn		6
+#define ReplicationOriginRelationId 6000
 
 void PGDLLEXPORT pglogical_sync_main(Datum main_arg);
 
@@ -524,50 +525,106 @@ static void
 copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 				PGLogicalRemoteRel *remoterel, List *replication_sets)
 {
-	PGLogicalRelation *rel;
-	PGresult   *res;
-	int			bytes;
-	char	   *copybuf;
-	List	   *attnamelist;
-	ListCell   *lc;
-	bool		first;
-	StringInfoData	query;
-	StringInfoData	attlist;
-	MemoryContext	curctx = CurrentMemoryContext,
-					oldctx;
+	PGLogicalRelation  *rel;
+	PGresult		   *res;
+	int					bytes, i;
+	char			   *copybuf, *nspname_ = NULL, *relname_ = NULL;
+	List			   *_attnames = NIL, *attnames_ = NIL;
+	ListCell		   *lc;
+	bool				first, isnull;
+	StringInfoData		query;
+	StringInfoData		_columns, columns_;
+	MemoryContext		curctx = CurrentMemoryContext, oldctx;
+	RangeVar		   *rv;
+	Relation			re;
+	TupleDesc			desc;
+	HeapTuple			tuple;
+	SysScanDesc			scan;
+	ScanKeyData			key[3];
 
-	/* Build the relation map. */
 	StartTransactionCommand();
 	oldctx = MemoryContextSwitchTo(curctx);
-	pglogical_relation_cache_updater(remoterel);
-	rel = pglogical_relation_open(remoterel->relid, AccessShareLock);
-	attnamelist = make_copy_attnamelist(rel);
 
-	initStringInfo(&attlist);
+	rv = makeRangeVar(EXTENSION_NAME, APPLY_MAPPING_TABLE, -1);
+	re = table_openrv(rv, AccessShareLock);
+	desc = RelationGetDescr(re);
+
+	ScanKeyInit(&key[0], 1, BTEqualStrategyNumber, F_OIDEQ , ObjectIdGetDatum(MySubscription->id));
+	ScanKeyInit(&key[1], 2, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(remoterel->nspname));
+	ScanKeyInit(&key[2], 3, BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(remoterel->relname));
+
+	scan = systable_beginscan(re, 0, true, NULL, 3, key);
+	tuple = systable_getnext(scan);
+
+	if (HeapTupleIsValid(tuple))
+	{
+		Datum srcattr,  dstattr;
+		nspname_ = pstrdup(TextDatumGetCString(heap_getattr(tuple, 5, desc, &isnull)));
+		relname_ = pstrdup(TextDatumGetCString(heap_getattr(tuple, 6, desc, &isnull)));
+		srcattr  = heap_getattr(tuple, 4, desc, &isnull);
+		dstattr  = heap_getattr(tuple, 7, desc, &isnull);
+		if (!isnull)
+		{
+			Datum		*_elems, *elems_;
+			int			 _nelem,  nelem_;
+			ArrayType	*_attrs, *attrs_;
+			_attrs = DatumGetArrayTypeP(srcattr);
+			deconstruct_array(_attrs, TEXTOID, -1, false, TYPALIGN_INT, &_elems, NULL, &_nelem);
+			attrs_ = DatumGetArrayTypeP(dstattr);
+			deconstruct_array(attrs_, TEXTOID, -1, false, TYPALIGN_INT, &elems_, NULL, &nelem_);
+			for (i = 0; i < _nelem && i < nelem_; i++)
+			{
+				_attnames = lappend(_attnames, makeString(TextDatumGetCString(_elems[i])));
+				attnames_ = lappend(attnames_, makeString(TextDatumGetCString(elems_[i])));
+			}
+		}
+	}
+	else
+	{
+		pglogical_relation_cache_updater(remoterel);
+		rel = pglogical_relation_open(remoterel->relid, AccessShareLock);
+		_attnames = make_copy_attnamelist(rel);
+		pglogical_relation_close(rel, AccessShareLock);
+	}
+
+	systable_endscan(scan);
+	table_close(re, AccessShareLock);
+
+	initStringInfo(&_columns);
 	first = true;
-	foreach (lc, attnamelist)
+	foreach (lc, _attnames)
 	{
 		char *attname = strVal(lfirst(lc));
 		if (first)
 			first = false;
 		else
-			appendStringInfoString(&attlist, ",");
-		appendStringInfoString(&attlist,
-							   PQescapeIdentifier(origin_conn, attname,
-												  strlen(attname)));
+			appendStringInfoString(&_columns, ",");
+		appendStringInfoString(&_columns, PQescapeIdentifier(origin_conn, attname, strlen(attname)));
 	}
+
+	if (attnames_ != NIL)
+	{
+		initStringInfo(&columns_);
+		first = true;
+		foreach (lc, attnames_)
+		{
+			char *attname = strVal(lfirst(lc));
+			if (first)
+				first = false;
+			else
+				appendStringInfoString(&columns_, ",");
+			appendStringInfoString(&columns_, PQescapeIdentifier(target_conn, attname, strlen(attname)));
+		}
+	}
+
 	MemoryContextSwitchTo(oldctx);
-	pglogical_relation_close(rel, AccessShareLock);
 	CommitTransactionCommand();
 
 	/* Build COPY TO query. */
 	initStringInfo(&query);
 	appendStringInfoString(&query, "COPY ");
 
-	/*
-	 * If the table is row-filtered we need to run query over the table
-	 * to execute the filter.
-	 */
+	/* If the table is row-filtered we need to run query over the table to execute the filter. */
 	if (remoterel->hasRowFilter)
 	{
 		StringInfoData	relname;
@@ -575,89 +632,70 @@ copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 		ListCell   *lc1;
 
 		initStringInfo(&relname);
-		appendStringInfo(&relname, "%s.%s",
-						 PQescapeIdentifier(origin_conn, remoterel->nspname,
-											strlen(remoterel->nspname)),
-						 PQescapeIdentifier(origin_conn, remoterel->relname,
-											strlen(remoterel->relname)));
+		appendStringInfo(&relname, "%s.%s", PQescapeIdentifier(origin_conn, remoterel->nspname, strlen(remoterel->nspname)), PQescapeIdentifier(origin_conn, remoterel->relname, strlen(remoterel->relname)));
 
 		initStringInfo(&repsetarr);
 		first = true;
 		foreach (lc1, replication_sets)
 		{
-			char	   *repset_name = lfirst(lc1);
+			char	*repset_name = lfirst(lc1);
 
 			if (first)
 				first = false;
 			else
 				appendStringInfoChar(&repsetarr, ',');
 
-			appendStringInfo(&repsetarr, "%s",
-							 PQescapeLiteral(origin_conn, repset_name,
-											 strlen(repset_name)));
+			appendStringInfo(&repsetarr, "%s", PQescapeLiteral(origin_conn, repset_name, strlen(repset_name)));
 		}
 
-		appendStringInfo(&query,
-						 "(SELECT %s FROM pglogical.table_data_filtered(NULL::%s, %s::regclass, ARRAY[%s])) ",
-						 list_length(attnamelist) ? attlist.data : "*",
-						 relname.data,
-						 PQescapeLiteral(origin_conn, relname.data, relname.len),
-						 repsetarr.data);
+		appendStringInfo(&query, "(SELECT %s FROM pglogical.table_data_filtered(NULL::%s, %s::regclass, ARRAY[%s])) ", list_length(_attnames) ? _columns.data : "*", relname.data, PQescapeLiteral(origin_conn, relname.data, relname.len), repsetarr.data);
 	}
 	else
 	{
-		/* Otherwise just copy the table. */
-		appendStringInfo(&query, "%s.%s ",
-						 PQescapeIdentifier(origin_conn, remoterel->nspname,
-											strlen(remoterel->nspname)),
-						 PQescapeIdentifier(origin_conn, remoterel->relname,
-											strlen(remoterel->relname)));
+		appendStringInfo(&query, "%s.%s ", PQescapeIdentifier(origin_conn, remoterel->nspname, strlen(remoterel->nspname)), PQescapeIdentifier(origin_conn, remoterel->relname, strlen(remoterel->relname)));
 
-		if (list_length(attnamelist))
-			appendStringInfo(&query, "(%s) ", attlist.data);
+		if (list_length(_attnames))
+			appendStringInfo(&query, "(%s) ", _columns.data);
 	}
 	appendStringInfoString(&query, "TO stdout");
-
 
 	/* Execute COPY TO. */
 	res = PQexec(origin_conn, query.data);
 	if (PQresultStatus(res) != PGRES_COPY_OUT)
 	{
-		ereport(ERROR,
-				(errmsg("table copy failed"),
-				 errdetail("Query '%s': %s", query.data,
-					 PQerrorMessage(origin_conn))));
+		ereport(ERROR, (errmsg("table copy failed"), errdetail("Query '%s': %s", query.data, PQerrorMessage(origin_conn))));
 	}
+	PQclear(res);
 
 	/* Build COPY FROM query. */
 	resetStringInfo(&query);
-	appendStringInfo(&query, "COPY %s.%s ",
-					 PQescapeIdentifier(origin_conn, remoterel->nspname,
-										strlen(remoterel->nspname)),
-					 PQescapeIdentifier(origin_conn, remoterel->relname,
-										strlen(remoterel->relname)));
-	if (list_length(attnamelist))
-		appendStringInfo(&query, "(%s) ", attlist.data);
+	if (nspname_ != NULL && relname_ != NULL)
+	{
+		appendStringInfo(&query, "COPY %s.%s ", PQescapeIdentifier(target_conn, nspname_, strlen(nspname_)), PQescapeIdentifier(target_conn, relname_, strlen(relname_)));
+	}
+	else
+	{
+		appendStringInfo(&query, "COPY %s.%s ", PQescapeIdentifier(origin_conn, remoterel->nspname, strlen(remoterel->nspname)), PQescapeIdentifier(origin_conn, remoterel->relname, strlen(remoterel->relname)));
+	}
+	if (attnames_ != NIL && list_length(attnames_))
+		appendStringInfo(&query, "(%s) ", columns_.data);
+	else if (_attnames != NIL && list_length(_attnames))
+		appendStringInfo(&query, "(%s) ", _columns.data);
 	appendStringInfoString(&query, "FROM stdin");
 
 	/* Execute COPY FROM. */
 	res = PQexec(target_conn, query.data);
 	if (PQresultStatus(res) != PGRES_COPY_IN)
 	{
-		ereport(ERROR,
-				(errmsg("table copy failed"),
-				 errdetail("Query '%s': %s", query.data,
-					 PQerrorMessage(origin_conn))));
+		ereport(ERROR, (errmsg("table copy failed"), errdetail("Query '%s': %s", query.data, PQerrorMessage(target_conn))));
 	}
+	PQclear(res);
 
 	while ((bytes = PQgetCopyData(origin_conn, &copybuf, false)) > 0)
 	{
 		if (PQputCopyData(target_conn, copybuf, bytes) != 1)
 		{
-			ereport(ERROR,
-					(errmsg("writing to target table failed"),
-					 errdetail("destination connection reported: %s",
-						 PQerrorMessage(target_conn))));
+			ereport(ERROR, (errmsg("writing to target table failed"), errdetail("destination connection reported: %s", PQerrorMessage(target_conn))));
 		}
 		PQfreemem(copybuf);
 
@@ -666,25 +704,15 @@ copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 
 	if (bytes != -1)
 	{
-		ereport(ERROR,
-				(errmsg("reading from origin table failed"),
-				 errdetail("source connection returned %d: %s",
-					bytes, PQerrorMessage(origin_conn))));
+		ereport(ERROR, (errmsg("reading from origin table failed"), errdetail("source connection returned %d: %s", bytes, PQerrorMessage(origin_conn))));
 	}
 
 	/* Send local finish */
 	if (PQputCopyEnd(target_conn, NULL) != 1)
 	{
-		ereport(ERROR,
-				(errmsg("sending copy-completion to destination connection failed"),
-				 errdetail("destination connection reported: %s",
-					 PQerrorMessage(target_conn))));
+		ereport(ERROR, (errmsg("sending copy-completion to destination connection failed"), errdetail("destination connection reported: %s", PQerrorMessage(target_conn))));
 	}
-
-	PQclear(res);
-
-	elog(INFO, "finished synchronization of data for table %s.%s",
-		 remoterel->nspname, remoterel->relname);
+	elog(INFO, "finished synchronization of data for table %s.%s", remoterel->nspname, remoterel->relname);
 }
 
 /*
