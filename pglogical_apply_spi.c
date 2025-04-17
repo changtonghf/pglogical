@@ -181,6 +181,7 @@ pglogical_apply_spi_update(PGLogicalRelation *rel, PGLogicalTupleData *oldtup,
 	StringInfoData	cmd;
 	Bitmapset	   *id_attrs;
 	int	att,
+		key,
 		narg,
 		firstarg;
 
@@ -198,6 +199,20 @@ pglogical_apply_spi_update(PGLogicalRelation *rel, PGLogicalTupleData *oldtup,
 
 		if (!newtup->changed[att])
 			continue;
+
+		if (id_attrs == NULL && RelationGetForm(rel->rel)->relkind == RELKIND_FOREIGN_TABLE)
+		{
+			bool isKey = false;
+			for (key = 0; key < rel->nkeys; key++)
+			{
+				if (strcmp(NameStr(TupleDescAttr(desc,att)->attname),rel->keynames[key]) == 0)
+				{
+					isKey = true;
+				}
+			}
+			if (isKey)
+				continue;
+		}
 
 		if (narg > 0)
 			appendStringInfo(&cmd, ", %s = $%u",
@@ -219,7 +234,20 @@ pglogical_apply_spi_update(PGLogicalRelation *rel, PGLogicalTupleData *oldtup,
 	firstarg = narg;
 	for (att = 0; att < desc->natts; att++)
 	{
-		if (!bms_is_member(TupleDescAttr(desc,att)->attnum - FirstLowInvalidHeapAttributeNumber,
+		if (id_attrs == NULL && RelationGetForm(rel->rel)->relkind == RELKIND_FOREIGN_TABLE)
+	    {
+	    	bool isKey = false;
+	    	for (key = 0; key < rel->nkeys; key++)
+	    	{
+	    		if (strcmp(NameStr(TupleDescAttr(desc,att)->attname),rel->keynames[key]) == 0)
+	    		{
+	    			isKey = true;
+	    		}
+	    	}
+	    	if (!isKey)
+	    		continue;
+	    }
+	    else if (!bms_is_member(TupleDescAttr(desc,att)->attnum - FirstLowInvalidHeapAttributeNumber,
 						   id_attrs))
 			continue;
 
@@ -259,6 +287,7 @@ pglogical_apply_spi_delete(PGLogicalRelation *rel, PGLogicalTupleData *oldtup)
 	StringInfoData	cmd;
 	Bitmapset	   *id_attrs;
 	int	att,
+		key,
 		narg;
 
 	id_attrs = RelationGetIndexAttrBitmap(rel->rel,
@@ -270,7 +299,20 @@ pglogical_apply_spi_delete(PGLogicalRelation *rel, PGLogicalTupleData *oldtup)
 
 	for (att = 0, narg = 0; att < desc->natts; att++)
 	{
-		if (!bms_is_member(TupleDescAttr(desc,att)->attnum - FirstLowInvalidHeapAttributeNumber,
+		if (id_attrs == NULL && RelationGetForm(rel->rel)->relkind == RELKIND_FOREIGN_TABLE)
+	    {
+	    	bool isKey = false;
+	    	for (key = 0; key < rel->nkeys; key++)
+	    	{
+	    		if (strcmp(NameStr(TupleDescAttr(desc,att)->attname),rel->keynames[key]) == 0)
+	    		{
+	    			isKey = true;
+	    		}
+	    	}
+	    	if (!isKey)
+	    		continue;
+	    }
+	    else if (!bms_is_member(TupleDescAttr(desc,att)->attnum - FirstLowInvalidHeapAttributeNumber,
 						   id_attrs))
 			continue;
 

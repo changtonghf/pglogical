@@ -74,6 +74,7 @@
 #include "pglogical_apply_spi.h"
 #include "pglogical.h"
 
+#define ReplicationOriginRelationId 6000
 
 void PGDLLEXPORT pglogical_apply_main(Datum main_arg);
 

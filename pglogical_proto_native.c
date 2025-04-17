@@ -43,7 +43,7 @@ static char decide_datum_transfer(Form_pg_attribute att,
 								  bool allow_binary_basetypes);
 
 static void pglogical_read_attrs(StringInfo in, char ***attrnames,
-								  int *nattrnames);
+								  int *nattrnames, char ***keynames, int *nkeynames);
 static void pglogical_read_tuple(StringInfo in, PGLogicalRelation *rel,
 					  PGLogicalTupleData *tuple);
 
@@ -843,6 +843,8 @@ pglogical_read_rel(StringInfo in)
 	char	   *relname;
 	int			natts;
 	char	  **attrnames;
+	int			nkeys;
+	char	  **keynames;
 
 	/* read the flags */
 	flags = pq_getmsgbyte(in);
@@ -859,9 +861,9 @@ pglogical_read_rel(StringInfo in)
 	relname = (char *) pq_getmsgbytes(in, len);
 
 	/* Get attribute description */
-	pglogical_read_attrs(in, &attrnames, &natts);
+	pglogical_read_attrs(in, &attrnames, &natts, &keynames, &nkeys);
 
-	pglogical_relation_cache_update(relid, schemaname, relname, natts, attrnames);
+	pglogical_relation_cache_update(relid, schemaname, relname, natts, attrnames, nkeys, keynames);
 
 	return relid;
 }
@@ -872,11 +874,13 @@ pglogical_read_rel(StringInfo in)
  * TODO handle flags.
  */
 static void
-pglogical_read_attrs(StringInfo in, char ***attrnames, int *nattrnames)
+pglogical_read_attrs(StringInfo in, char ***attrnames, int *nattrnames, char ***keynames, int *nkeynames)
 {
 	int			i;
 	uint16		nattrs;
 	char	  **attrs;
+	int			nkeys = 0;
+	char	  **keys;
 	char		blocktype;
 
 	blocktype = pq_getmsgbyte(in);
@@ -885,17 +889,19 @@ pglogical_read_attrs(StringInfo in, char ***attrnames, int *nattrnames)
 
 	nattrs = pq_getmsgint(in, 2);
 	attrs = palloc(nattrs * sizeof(char *));
+	keys = palloc(nattrs * sizeof(char *));
 
 	/* read the attributes */
 	for (i = 0; i < nattrs; i++)
 	{
 		uint16			len;
+		uint8			flags = 0;
 
 		blocktype = pq_getmsgbyte(in);		/* column definition follows */
 		if (blocktype != 'C')
 			elog(ERROR, "expected COLUMN, got %c", blocktype);
-		/* read flags (we ignore them so far) */
-		(void) pq_getmsgbyte(in);
+
+		flags = pq_getmsgint(in, 1);
 
 		blocktype = pq_getmsgbyte(in);		/* column name block follows */
 		if (blocktype != 'N')
@@ -905,8 +911,15 @@ pglogical_read_attrs(StringInfo in, char ***attrnames, int *nattrnames)
 		len = pq_getmsgint(in, 2);
 		/* the string is NULL terminated */
 		attrs[i] = (char *) pq_getmsgbytes(in, len);
+		if (flags == 1)
+		{
+			keys[nkeys] = attrs[i];
+			nkeys += 1;
+		}
 	}
 
 	*attrnames = attrs;
 	*nattrnames = nattrs;
+	*keynames = keys;
+	*nkeynames = nkeys;
 }

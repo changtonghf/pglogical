@@ -1039,3 +1039,5 @@ Version 2.4.0 is a maintenance release of pglogical 2.
 
 * Make sure debug_query_string is always set  
   Newer versions of PostgreSQL require that debug_query_string is always set.
+
+* Add foreign table support for subscriber node

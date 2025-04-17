@@ -43,6 +43,16 @@ CREATE TABLE pglogical.local_sync_status (
     UNIQUE (sync_subid, sync_nspname, sync_relname)
 );
 
+CREATE TABLE pglogical.rel_apply_mapping (
+    sub_id oid NOT NULL REFERENCES pglogical.subscription(sub_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    src_nspname text NOT NULL DEFAULT 'public',
+    src_relname text NOT NULL,
+    src_attname text[],
+    dst_nspname text NOT NULL DEFAULT 'public',
+    dst_relname text NOT NULL,
+    dst_attname text[],
+    UNIQUE (sub_id, src_nspname, src_relname)
+);
 
 CREATE FUNCTION pglogical.create_node(node_name name, dsn text)
 RETURNS oid STRICT VOLATILE LANGUAGE c AS 'MODULE_PATHNAME', 'pglogical_create_node';
@@ -170,6 +180,8 @@ RETURNS boolean STRICT VOLATILE LANGUAGE c AS 'MODULE_PATHNAME', 'pglogical_drop
 CREATE FUNCTION pglogical.replication_set_add_table(set_name name, relation regclass, synchronize_data boolean DEFAULT false,
 	columns text[] DEFAULT NULL, row_filter text DEFAULT NULL)
 RETURNS boolean CALLED ON NULL INPUT VOLATILE LANGUAGE c AS 'MODULE_PATHNAME', 'pglogical_replication_set_add_table';
+CREATE FUNCTION pglogical.replication_set_alter_table(set_name name, relation regclass, synchronize_data boolean DEFAULT false, columns text[] DEFAULT NULL, row_filter text DEFAULT NULL)
+RETURNS boolean CALLED ON NULL INPUT VOLATILE LANGUAGE c AS 'MODULE_PATHNAME', 'pglogical_replication_set_alter_table';
 CREATE FUNCTION pglogical.replication_set_add_all_tables(set_name name, schema_names text[], synchronize_data boolean DEFAULT false)
 RETURNS boolean STRICT VOLATILE LANGUAGE c AS 'MODULE_PATHNAME', 'pglogical_replication_set_add_all_tables';
 CREATE FUNCTION pglogical.replication_set_remove_table(set_name name, relation regclass)

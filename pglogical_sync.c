@@ -85,6 +85,7 @@
 #define Anum_sync_relname		4
 #define Anum_sync_status		5
 #define Anum_sync_statuslsn		6
+#define ReplicationOriginRelationId 6000
 
 void PGDLLEXPORT pglogical_sync_main(Datum main_arg);
 
