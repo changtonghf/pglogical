@@ -1486,8 +1486,27 @@ apply_work(PGconn *streamConn)
 		send_feedback(applyconn, last_received, GetCurrentTimestamp(), false);
 
 		if (!in_remote_transaction)
+		{
 			process_syncing_tables(last_received);
-		
+			/* In case there is nothing to catchup, finish immediately. */
+			if (MyPGLogicalWorker->worker_type == PGLOGICAL_WORKER_SYNC)
+			{
+				PGLogicalSyncStatus	*sync;
+				MyApplyWorker->sync_pending = true;
+				StartTransactionCommand();
+				sync = get_table_sync_status(MyApplyWorker->subid, 
+							NameStr(MyPGLogicalWorker->worker.sync.nspname), 
+							NameStr(MyPGLogicalWorker->worker.sync.relname), true);
+				if (sync && sync->status == SYNC_STATUS_READY)
+				{
+					pglogical_sync_worker_finish();
+					proc_exit(0);
+				}
+				CommitTransactionCommand();
+				MemoryContextSwitchTo(MessageContext);
+			}
+		}
+
 		/* We must not have switched out of MessageContext by mistake */
 		Assert(CurrentMemoryContext == MessageContext);
 
@@ -1769,8 +1788,8 @@ process_syncing_tables(XLogRecPtr end_lsn)
 					LWLockRelease(PGLogicalCtx->lock);
 			}
 
-			if (sync->status == SYNC_STATUS_SYNCDONE &&
-				end_lsn >= sync->statuslsn)
+			if ((sync->status == SYNC_STATUS_CATCHUP) || 
+				(sync->status == SYNC_STATUS_SYNCDONE && end_lsn >= sync->statuslsn))
 			{
 				sync->status = SYNC_STATUS_READY;
 				sync->statuslsn = end_lsn;
@@ -1829,9 +1848,13 @@ process_syncing_tables(XLogRecPtr end_lsn)
 		}
 		LWLockRelease(PGLogicalCtx->lock);
 
-		if (nworkers < 1)
+		if (nworkers < pglogical_max_sync_workers_per_subscription)
 		{
-			start_sync_worker(&sync->nspname, &sync->relname);
+			if (sync->status == SYNC_STATUS_INIT)
+				start_sync_worker(&sync->nspname, &sync->relname);
+		}
+		else
+		{
 			break;
 		}
 	}

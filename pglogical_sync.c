@@ -648,7 +648,7 @@ copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 		ereport(ERROR,
 				(errmsg("table copy failed"),
 				 errdetail("Query '%s': %s", query.data,
-					 PQerrorMessage(origin_conn))));
+					 PQerrorMessage(target_conn))));
 	}
 
 	while ((bytes = PQgetCopyData(origin_conn, &copybuf, false)) > 0)

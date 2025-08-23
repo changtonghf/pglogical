@@ -92,6 +92,7 @@ bool	pglogical_synchronous_commit = false;
 char   *pglogical_temp_directory = "";
 bool	pglogical_use_spi = false;
 bool	pglogical_batch_inserts = true;
+int		pglogical_max_sync_workers_per_subscription = 1;
 static char *pglogical_temp_directory_config;
 
 #if PG_VERSION_NUM >= 150000
@@ -851,6 +852,12 @@ _PG_init(void)
 							   PGC_SIGHUP,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pglogical.max_sync_workers_per_subscription",
+							"Maximum number of sync workers per subscription.",
+							NULL,
+							&pglogical_max_sync_workers_per_subscription,
+							4, 1, 16, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	if (IsBinaryUpgrade)
 		return;

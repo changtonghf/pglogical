@@ -46,6 +46,7 @@ extern char *pglogical_temp_directory;
 extern bool pglogical_use_spi;
 extern bool pglogical_batch_inserts;
 extern char *pglogical_extra_connection_options;
+extern int	pglogical_max_sync_workers_per_subscription;
 
 #if PG_VERSION_NUM >= 150000
 extern shmem_request_hook_type prev_shmem_request_hook;
