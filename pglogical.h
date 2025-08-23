@@ -33,9 +33,9 @@
 #define PGLOGICAL_MIN_PROTO_VERSION_NUM 1
 #define PGLOGICAL_MAX_PROTO_VERSION_NUM 1
 
-#define EXTENSION_NAME "pglogical"
-
-#define REPLICATION_ORIGIN_ALL "all"
+#define EXTENSION_NAME			"pglogical"
+#define REPLICATION_ORIGIN_ALL	"all"
+#define APPLY_MAPPING_TABLE		"rel_apply_mapping"
 
 #if PG_VERSION_NUM >= 90500
 #define HAVE_REPLICATION_ORIGINS

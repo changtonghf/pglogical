@@ -51,7 +51,8 @@ CREATE TABLE pglogical.rel_apply_mapping (
     dst_nspname text NOT NULL DEFAULT 'public',
     dst_relname text NOT NULL,
     dst_attname text[],
-    UNIQUE (sub_id, src_nspname, src_relname)
+    UNIQUE (sub_id, src_nspname, src_relname),
+    CHECK (COALESCE(array_length(src_attname,1),0) = COALESCE(array_length(dst_attname,1),0))
 );
 
 CREATE FUNCTION pglogical.create_node(node_name name, dsn text)

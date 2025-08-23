@@ -30,7 +30,6 @@
 #include "pglogical_relcache.h"
 #include "pglogical_worker.h"
 
-#define APPLY_MAPPING_TABLE	"rel_apply_mapping"
 #define PGLOGICALRELATIONHASH_INITIAL_SIZE 128
 static HTAB *PGLogicalRelationHash = NULL;
 
