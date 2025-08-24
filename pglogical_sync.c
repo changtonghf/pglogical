@@ -544,8 +544,6 @@ copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 
 	StartTransactionCommand();
 	oldctx = MemoryContextSwitchTo(curctx);
-	pglogical_relation_cache_updater(remoterel);
-	rel = pglogical_relation_open(remoterel->relid, AccessShareLock);
 
 	rv = makeRangeVar(EXTENSION_NAME, APPLY_MAPPING_TABLE, -1);
 	re = table_openrv(rv, AccessShareLock);
@@ -565,11 +563,7 @@ copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 		relname_ = pstrdup(TextDatumGetCString(heap_getattr(tuple, 6, desc, &isnull)));
 		srcattr  = heap_getattr(tuple, 4, desc, &isnull);
 		dstattr  = heap_getattr(tuple, 7, desc, &isnull);
-		if (isnull)
-		{
-			_attnames = make_copy_attnamelist(rel);
-		}
-		else
+		if (!isnull)
 		{
 			Datum		*_elems, *elems_;
 			int			 _nelem,  nelem_;
@@ -587,7 +581,10 @@ copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 	}
 	else
 	{
+		pglogical_relation_cache_updater(remoterel);
+		rel = pglogical_relation_open(remoterel->relid, AccessShareLock);
 		_attnames = make_copy_attnamelist(rel);
+		pglogical_relation_close(rel, AccessShareLock);
 	}
 
 	systable_endscan(scan);
@@ -621,7 +618,6 @@ copy_table_data(PGconn *origin_conn, PGconn *target_conn,
 	}
 
 	MemoryContextSwitchTo(oldctx);
-	pglogical_relation_close(rel, AccessShareLock);
 	CommitTransactionCommand();
 
 	/* Build COPY TO query. */
